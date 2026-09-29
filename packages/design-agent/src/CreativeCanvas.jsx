@@ -92,10 +92,12 @@ export default function CreativeCanvas({
   onGenerationEnd,
   onGenerationComplete,
   onGenerationError,
+  runtime = null,
 }) {
   const router = useRouter();
   const searchParams = useSearchParams();
   const inEmbedMode = isEmbed && !!embedCode;
+  const runtimeMode = runtime?.mode === 'shiryucore';
   const embedStorageKey = inEmbedMode ? `muapi_agent_session_${embedCode}` : null;
   const notifiedGenerationEventsRef = useRef(new Set());
   const generationActivityEventIdsRef = useRef(new Set());
@@ -103,7 +105,7 @@ export default function CreativeCanvas({
     if (typeof window === "undefined" || !embedStorageKey) return null;
     return window.localStorage.getItem(embedStorageKey) || null;
   });
-  const sessionId = inEmbedMode ? embedSessionId : searchParams.get("session");
+  const sessionId = runtimeMode ? 'shiryucore-design-agent' : (inEmbedMode ? embedSessionId : searchParams.get("session"));
 
   const [input, setInput] = useState("");
   const [messages, setMessages] = useState([]);
@@ -132,7 +134,7 @@ export default function CreativeCanvas({
   const [hoveredAsset, setHoveredAsset] = useState(null);
 
   // Left Sidebar and Session Management
-  const [showLeftSidebar, setShowLeftSidebar] = useState(true);
+  const [showLeftSidebar, setShowLeftSidebar] = useState(() => !runtimeMode);
   const [editingSessionId, setEditingSessionId] = useState(null);
   const [editingSessionName, setEditingSessionName] = useState("");
   const [hoveredSessionId, setHoveredSessionId] = useState(null);
@@ -188,19 +190,24 @@ export default function CreativeCanvas({
   // Initialize
   useEffect(() => {
     setMounted(true);
+    if (runtimeMode) {
+      setCurrentSessionName('Design Agent · ShiryuCore');
+      setMessages([{ role: "assistant", content: `Hello ${user?.username || "User"} — what shall we create today?`, timestamp: new Date().toISOString() }]);
+      return;
+    }
     // In embed mode there's no concept of "switch to another session" — the
     // visitor only ever sees the one keyed by their localStorage. Skip the
     // sessions list fetch (which would also 403-on-allowed-origins or surface
     // sessions from other embeds spawned by the same owner).
     if (!inEmbedMode) fetchSessions();
     fetchSkills();
-  }, []);
+  }, [runtimeMode]);
 
   // Handle initial query and skill from URL (Fallback only)
   useEffect(() => {
     if (!mounted || busy || initialHandoffProcessed.current) return;
-    // Embed pages never have a / handoff URL — skip.
-    if (inEmbedMode) {
+    // Core runtime and embed pages do not consume the legacy URL handoff format.
+    if (runtimeMode || inEmbedMode) {
       initialHandoffProcessed.current = true;
       return;
     }
@@ -255,9 +262,14 @@ export default function CreativeCanvas({
       newParams.delete("a");
       router.replace(`?${newParams.toString()}`, { scroll: false });
     }
-  }, [mounted, busy, messages, skills.length, searchParams]);
+  }, [mounted, busy, messages, skills.length, searchParams, runtimeMode]);
 
   useEffect(() => {
+    if (runtimeMode) {
+      syncedUrlsRef.current.clear();
+      setCurrentSessionName('Design Agent · ShiryuCore');
+      return;
+    }
     if (justCreatedSessionRef.current) {
       justCreatedSessionRef.current = false;
       return;
@@ -280,9 +292,10 @@ export default function CreativeCanvas({
       setAssets([]);
       setCurrentSessionName("New Session");
     }
-  }, [sessionId]); // Removed sessions from deps to avoid infinite loop if fetchSessions updates sessions
+  }, [sessionId, runtimeMode]); // Removed sessions from deps to avoid infinite loop if fetchSessions updates sessions
 
   const fetchSessions = async () => {
+    if (runtimeMode) return;
     try {
       const { data } = await axios.get(`${API}/sessions`, { headers: getHeaders() });
       setSessions(data);
@@ -294,6 +307,7 @@ export default function CreativeCanvas({
   };
 
   const fetchSkills = async () => {
+    if (runtimeMode) return;
     try {
       const { data } = await axios.get(`${API}/agent-skills`, { headers: getHeaders() });
       setSkills(data);
@@ -567,6 +581,7 @@ export default function CreativeCanvas({
   };
 
   const loadHistory = async () => {
+    if (runtimeMode) return;
     try {
       const { data } = await axios.get(`${API}/sessions/${sessionId}/messages`, { headers: getHeaders() });
       if (data && data.length > 0) {
@@ -594,7 +609,7 @@ export default function CreativeCanvas({
   };
 
   const checkActiveJobs = async (currentMessages) => {
-    if (!sessionId) return;
+    if (runtimeMode || !sessionId) return;
     try {
       const { data } = await axios.get(`${API}/sessions/${sessionId}/jobs`, { headers: getHeaders() });
       const active = data.find(j => (j.status === "pending" || j.status === "processing") && j.id);
@@ -616,7 +631,7 @@ export default function CreativeCanvas({
   };
 
   const loadAssets = async () => {
-    if (!sessionId) return;
+    if (runtimeMode || !sessionId) return;
     try {
       const { data } = await axios.get(`${API}/sessions/${sessionId}/assets`, { headers: getHeaders() });
       setAssets(data);
@@ -628,6 +643,7 @@ export default function CreativeCanvas({
   }, [messages, busy]);
   
   const ensureSession = async () => {
+    if (runtimeMode) return 'shiryucore-design-agent';
     if (sessionId) return sessionId;
     const { data } = await axios.post(`${API}/sessions`, {}, { headers: getHeaders() });
     justCreatedSessionRef.current = true;
@@ -647,6 +663,31 @@ export default function CreativeCanvas({
     setUploadProgress(0);
 
     try {
+      if (runtimeMode) {
+        if (typeof runtime?.uploadFile !== 'function') {
+          throw new Error('ShiryuCore upload runtime is unavailable.');
+        }
+        const uploaded = await runtime.uploadFile(file, setUploadProgress);
+        if (!uploaded?.url) throw new Error('ShiryuCore did not return an uploaded asset URL.');
+        const kind = uploaded.kind || (file.type?.startsWith("video/") ? "video"
+          : file.type?.startsWith("audio/") ? "audio"
+          : "image");
+        const assetLabel = uploaded.asset_label || `core_upload_${Date.now()}`;
+        const asset = {
+          asset_label: assetLabel,
+          url: uploaded.url,
+          kind,
+          source_tool: 'ShiryuCore',
+          model: null,
+          prompt: null,
+          core_asset_id: uploaded.assetId || null,
+        };
+        setAttachments(prev => [...prev, asset]);
+        setAssets(prev => [...prev, asset]);
+        toast.success(`Uploaded to ShiryuCore as ${assetLabel}`);
+        return;
+      }
+
       // 0. Make sure we have a session — uploaded assets must belong to one.
       const activeSessionId = await ensureSession();
 
@@ -780,6 +821,54 @@ export default function CreativeCanvas({
         canvasState = canvasRef.current?.getCanvasState?.() || null;
       } catch {}
 
+      if (runtimeMode) {
+        if (typeof runtime?.sendMessage !== 'function') {
+          throw new Error('ShiryuCore Design Agent runtime is unavailable.');
+        }
+        const runtimeResult = await runtime.sendMessage({
+          message: typed,
+          messages: updatedMessages,
+          attachments: msgAttachments,
+          assets,
+          canvasState,
+          skill: currentSkill,
+        });
+        const assistantMessage = runtimeResult?.message || 'Completed with ShiryuCore.';
+        setMessages(prev => {
+          const arr = [...prev];
+          if (aIdx >= 0) arr[aIdx] = {
+            ...arr[aIdx],
+            content: assistantMessage,
+            events: [],
+            timestamp: new Date().toISOString(),
+          };
+          return arr;
+        });
+
+        const generatedAsset = runtimeResult?.asset;
+        if (generatedAsset?.url) {
+          setAssets(prev => {
+            const existingIndex = prev.findIndex((asset) =>
+              (generatedAsset.asset_label && asset.asset_label === generatedAsset.asset_label)
+              || asset.url === generatedAsset.url,
+            );
+            if (existingIndex === -1) return [...prev, generatedAsset];
+            const next = [...prev];
+            next[existingIndex] = { ...next[existingIndex], ...generatedAsset };
+            return next;
+          });
+
+          const syncKey = `${generatedAsset.asset_label || 'no-label'}-${generatedAsset.url}`;
+          const sourceLabel = canvasState?.selected;
+          const place = canvasRef.current?.placeNextToSource || canvasRef.current?.replaceAt;
+          if (sourceLabel && place) {
+            place(sourceLabel, generatedAsset.url, generatedAsset.kind || 'image', generatedAsset.asset_label);
+            syncedUrlsRef.current.add(syncKey);
+          }
+        }
+        return;
+      }
+
       let endpoint = `${API}/sessions/${activeSessionId}/chat`;
       let payload = {
         message: typed,
@@ -812,13 +901,15 @@ export default function CreativeCanvas({
       });
     } finally {
       setBusy(false);
-      await loadAssets();
-      if (activeSessionId) {
-        setMessages(prev => {
-          const newMsgs = [...prev];
-          axios.patch(`${API}/sessions/${activeSessionId}/messages`, { messages: newMsgs }, { headers: getHeaders() }).catch(() => {});
-          return newMsgs;
-        });
+      if (!runtimeMode) {
+        await loadAssets();
+        if (activeSessionId) {
+          setMessages(prev => {
+            const newMsgs = [...prev];
+            axios.patch(`${API}/sessions/${activeSessionId}/messages`, { messages: newMsgs }, { headers: getHeaders() }).catch(() => {});
+            return newMsgs;
+          });
+        }
       }
     }
   };
